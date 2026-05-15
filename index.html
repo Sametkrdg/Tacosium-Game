@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <!-- Mobil çentik uyumu, 0ms tap delay ve yakınlaştırma engeli -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Tacosium MVP</title>
+
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <style>
+        /* Mobil UX Yamaları: Çift tıklama yakınlaştırması ve lastik gibi kaydırmayı engelleme */
+        html, body {
+            margin: 0;
+            height: 100%;
+            width: 100%;
+            overscroll-behavior: none;
+            -webkit-overflow-scrolling: auto;
+        }
+        body {
+            touch-action: none;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-touch-callout: none;
+            -webkit-tap-highlight-color: transparent;
+            overflow: hidden;
+            position: fixed;
+            inset: 0;
+            background-color: #f3f4f6;
+            /* Çentik (Notch) Güvenli Alanları */
+            padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+        }
+        #game-canvas, #start-btn {
+            touch-action: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+    </style>
+</head>
+<body class="w-screen h-screen flex flex-col items-center justify-center">
+
+    <!-- Kilit Ekranı (Başlangıçta gizlidir) -->
+    <div id="lock-screen" class="hidden flex-col items-center justify-center h-full w-full bg-gray-900 text-white text-center p-4">
+        <h1 id="reward-title" class="text-3xl font-bold mb-4">İndiriminiz Hazır!</h1>
+        <p id="reward-discount" class="text-5xl font-extrabold text-yellow-400 mb-3">%0 İNDİRİM</p>
+        <p class="text-base mb-2">Skorunuz: <span id="reward-score" class="font-bold text-white">0</span></p>
+        <p class="text-lg mb-2">Kasa Kodunuz: <span id="reward-code" class="text-yellow-400 font-bold text-2xl">TACO-0</span></p>
+        <p class="text-sm text-gray-400 mt-4">Yeni bir oyun için kalan süre:</p>
+        <!-- Hareketli element: Statik ekran görüntüsü ile personeli kandırmayı engeller -->
+        <div id="countdown" class="text-4xl font-mono mt-2 animate-pulse text-red-400">03:00:00</div>
+    </div>
+
+    <!-- Ana Oyun Ekranı -->
+    <div id="game-screen" class="flex flex-col items-center justify-center h-full w-full max-w-md bg-white shadow-xl relative">
+        
+        <!-- Doyum Metre UI -->
+        <div class="absolute top-4 left-4 right-4 bg-gray-200 rounded-full h-6 overflow-hidden border-2 border-gray-300 z-20">
+            <div id="doyum-bar" class="bg-green-500 h-full w-0 transition-all duration-200"></div>
+            <span id="doyum-text" class="absolute inset-0 flex items-center justify-center text-xs font-bold text-gray-800">Doyum: %0</span>
+        </div>
+
+        <!-- Süre & Skor HUD -->
+        <div class="absolute top-12 left-4 right-4 flex items-center justify-between z-20 pointer-events-none">
+            <div id="score-text" class="bg-white/80 px-3 py-1 rounded-full text-sm font-bold text-gray-800 shadow">Skor: 0</div>
+            <div id="timer-text" class="bg-red-500 text-white px-3 py-1 rounded-full text-sm font-bold shadow">Süre: 10s</div>
+        </div>
+
+        <!-- Başlat Butonu (Mobil tarayıcıların ses engelini aşmak için zorunlu ilk dokunuş) -->
+        <button id="start-btn" class="absolute z-30 bg-orange-500 text-white px-8 py-4 rounded-full font-bold text-xl shadow-lg active:scale-95 transition-transform">
+            START GAME
+        </button>
+
+        <!-- Oyun Motoru Alanı -->
+        <canvas id="game-canvas" class="w-full h-full bg-blue-50"></canvas>
+    </div>
+
+    <script>
+        /**
+         * Feature 1: The Boot & Security Lock Gatekeeper
+         * Sayfa render edilmeden önce localStorage taraması yapılır.
+         */
+        const LOCK_KEY = 'tacosium_lock_timestamp';
+        const LOCK_DURATION = 3 * 60 * 60 * 1000; // 3 Saat (Milisaniye)
+
+        /**
+         * ============================================================
+         * TEST TOGGLE — PRODUCTION DEPLOYMENT'TAN ÖNCE `false` YAPIN!
+         * ------------------------------------------------------------
+         * true  → 3 saatlik kilit tamamen devre dışı (yerel test için).
+         * false → Gatekeeper kilidi normal şekilde çalışır.
+         * ============================================================
+         */
+        const DISABLE_LOCK_FOR_TESTING = true;
+
+        /**
+         * Mobil UX Yamaları (Global):
+         *  - iOS pinch-zoom jestlerini iptal et
+         *  - Çift-tıklama yakınlaştırmasını engelle
+         *  - Body üzerindeki rubber-banding kaydırmasını engelle (canvas dokunuşları hariç)
+         */
+        ['gesturestart', 'gesturechange', 'gestureend'].forEach(ev => {
+            document.addEventListener(ev, e => e.preventDefault(), { passive: false });
+        });
+        let __lastTouchEnd = 0;
+        document.addEventListener('touchend', (e) => {
+            const now = Date.now();
+            if (now - __lastTouchEnd <= 350) e.preventDefault();
+            __lastTouchEnd = now;
+        }, { passive: false });
+        document.addEventListener('dblclick', (e) => e.preventDefault(), { passive: false });
+        // Sayfa düzeyinde rubber-band scrolling'i durdur (oyun motorunun touchmove'unu bozmadan)
+        document.addEventListener('touchmove', (e) => {
+            if (e.cancelable) e.preventDefault();
+        }, { passive: false });
+
+        // Ses bağlamı (Web Audio) — sadece kullanıcı dokunduktan sonra unlock edilir
+        let audioCtx = null;
+        function unlockAudio() {
+            if (audioCtx) return audioCtx;
+            try {
+                const Ctor = window.AudioContext || window.webkitAudioContext;
+                if (!Ctor) return null;
+                audioCtx = new Ctor();
+                // Sessiz bir buffer oynat — iOS Safari'de sesi gerçekten unlock eder
+                const buf = audioCtx.createBuffer(1, 1, 22050);
+                const src = audioCtx.createBufferSource();
+                src.buffer = buf;
+                src.connect(audioCtx.destination);
+                src.start(0);
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+            } catch (_) { audioCtx = null; }
+            return audioCtx;
+        }
+
+        function checkLock() {
+            // TEST BYPASS: kilit mantığını tamamen atla (üretimde `false` olmalı)
+            if (DISABLE_LOCK_FOR_TESTING) {
+                return false;
+            }
+
+            const storedTime = localStorage.getItem(LOCK_KEY);
+            if (storedTime) {
+                const timePassed = Date.now() - parseInt(storedTime);
+                if (timePassed < LOCK_DURATION) {
+                    // Kilit aktif: Oyun ekranını tamamen gizle, kilit ekranını göster
+                    document.getElementById('game-screen').classList.add('hidden');
+                    document.getElementById('lock-screen').classList.remove('hidden');
+                    document.getElementById('lock-screen').classList.add('flex');
+                    
+                    // TODO: Geri sayım sayacı mekanizmasını (setInterval) buraya entegre edeceğiz
+                    return true;
+                } else {
+                    // 3 saat dolmuş, eski kilidi kaldır
+                    localStorage.removeItem(LOCK_KEY);
+                }
+            }
+            return false;
+        }
+
+        // Kilitliyse oyunun geri kalanını başlatma
+        if (!checkLock()) {
+            initGame();
+        }
+
+        function initGame() {
+            const canvas = document.getElementById('game-canvas');
+            const ctx = canvas.getContext('2d');
+            const doyumBar = document.getElementById('doyum-bar');
+            const doyumText = document.getElementById('doyum-text');
+            const scoreText = document.getElementById('score-text');
+            const timerText = document.getElementById('timer-text');
+            const rewardTitle = document.getElementById('reward-title');
+            const rewardDiscount = document.getElementById('reward-discount');
+            const rewardCode = document.getElementById('reward-code');
+            const rewardScore = document.getElementById('reward-score');
+            const startBtn = document.getElementById('start-btn');
+            const gameScreen = document.getElementById('game-screen');
+            const lockScreen = document.getElementById('lock-screen');
+
+            const gameState = {
+                score: 0,
+                timeLeft: 60, // seconds
+                running: false,
+                ended: false,
+            };
+
+            // --- Tunables ---
+            const BASKET_W = 80;
+            const BASKET_H = 24;
+            const BASKET_Y_OFFSET = 70;
+            const ITEM_SIZE = 120;
+            // Performance budget: stay within 10–20 simultaneous objects on screen.
+            const MIN_ITEMS = 4;
+            const MAX_ITEMS = 15;
+
+            // Round duration & difficulty (10-second sprint)
+            const ROUND_SECONDS = 10;
+            const MAX_SCORE = 1000; // Doyum Metre is normalized against the top tier
+            const SCORE_PER_CATCH = 5;
+
+            // Spawn ~1 item / second to keep the screen readable. Player must
+            // catch nearly every one to reach the 1000-pt top tier.
+            const BASE_SPAWN_INTERVAL_MS = 800;
+            const BASE_FALL_SPEED_MIN = 400;
+            const BASE_FALL_SPEED_MAX = 1000;
+
+            // End-game difficulty (interpolated as score → MAX_SCORE)
+            const HARD_SPAWN_INTERVAL_MS = 480;
+            const HARD_FALL_SPEED_MIN = 1500;
+            const HARD_FALL_SPEED_MAX = 2000;
+
+            // Lateral drift (px/sec) — items slide sideways while falling,
+            // bouncing off the walls. Scaled with difficulty.
+            const BASE_DRIFT = 80;
+            const HARD_DRIFT = 260;
+
+            // 3-Tier Reward Thresholds (tuned for the 10-second sprint)
+            const REWARD_TIERS = [
+                { min: 500, percent: 20, code: 'TACO-20' },
+                { min: 250,  percent: 10, code: 'TACO-10' },
+                { min: 0,  percent: 5,  code: 'TACO-5'  },
+            ];
+
+            function getReward(score) {
+                for (const tier of REWARD_TIERS) {
+                    if (score >= tier.min) return tier;
+                }
+                return null;
+            }
+
+            // Linearly interpolate base→hard difficulty based on progress to MAX_SCORE
+            function difficulty() {
+                const t = Math.max(0, Math.min(1, gameState.score / MAX_SCORE));
+                return {
+                    spawnInterval: BASE_SPAWN_INTERVAL_MS + (HARD_SPAWN_INTERVAL_MS - BASE_SPAWN_INTERVAL_MS) * t,
+                    speedMin: BASE_FALL_SPEED_MIN + (HARD_FALL_SPEED_MIN - BASE_FALL_SPEED_MIN) * t,
+                    speedMax: BASE_FALL_SPEED_MAX + (HARD_FALL_SPEED_MAX - BASE_FALL_SPEED_MAX) * t,
+                    drift: BASE_DRIFT + (HARD_DRIFT - BASE_DRIFT) * t,
+                };
+            }
+
+            // --- DPR-aware canvas sizing ---
+            let viewW = 0, viewH = 0;
+            function resizeCanvas() {
+                const rect = canvas.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                viewW = rect.width;
+                viewH = rect.height;
+                canvas.width = Math.floor(viewW * dpr);
+                canvas.height = Math.floor(viewH * dpr);
+                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                basket.y = viewH - BASKET_Y_OFFSET;
+                const maxX = viewW - basket.w;
+                if (basket.x > maxX) basket.x = Math.max(0, maxX);
+            }
+
+            const basket = { x: 0, y: 0, w: BASKET_W, h: BASKET_H };
+            const items = [];
+            let rafId = null;
+            let lastFrameTime = 0;
+            let spawnAcc = 0;
+
+            // --- UI: Doyum Metre + Skor + Süre ---
+            function updateMeterUI() {
+                const pct = Math.min(100, Math.round((gameState.score / MAX_SCORE) * 100));
+                doyumBar.style.width = pct + '%';
+                doyumText.textContent = 'Doyum: %' + pct;
+                scoreText.textContent = 'Skor: ' + gameState.score;
+            }
+            function updateTimerUI() {
+                const t = Math.max(0, Math.ceil(gameState.timeLeft));
+                timerText.textContent = 'Süre: ' + t + 's';
+            }
+
+            // --- Controls (touch + mouse, drag the basket) ---
+            let dragging = false;
+            let dragOffsetX = 0;
+
+            function pointerX(e) {
+                if (e.touches && e.touches.length) {
+                    return e.touches[0].clientX - canvas.getBoundingClientRect().left;
+                }
+                return e.clientX - canvas.getBoundingClientRect().left;
+            }
+            function moveBasket(localX) {
+                let nx = localX - dragOffsetX;
+                const maxX = viewW - basket.w;
+                if (nx < 0) nx = 0;
+                if (nx > maxX) nx = maxX;
+                basket.x = nx;
+            }
+            function onDown(e) {
+                if (!gameState.running) return;
+                e.preventDefault();
+                const x = pointerX(e);
+                dragging = true;
+                dragOffsetX = (x >= basket.x && x <= basket.x + basket.w) ? (x - basket.x) : basket.w / 2;
+                moveBasket(x);
+            }
+            function onMove(e) {
+                if (!dragging) return;
+                e.preventDefault();
+                moveBasket(pointerX(e));
+            }
+            function onUp() { dragging = false; }
+
+            canvas.addEventListener('touchstart', onDown, { passive: false });
+            canvas.addEventListener('touchmove', onMove, { passive: false });
+            canvas.addEventListener('touchend', onUp, { passive: false });
+            canvas.addEventListener('touchcancel', onUp, { passive: false });
+            canvas.addEventListener('mousedown', onDown);
+            canvas.addEventListener('mousemove', onMove);
+            canvas.addEventListener('mouseup', onUp);
+            canvas.addEventListener('mouseleave', onUp);
+
+            // --- Spawning (difficulty-scaled, scattered X) ---
+            let lastSpawnX = -1;
+            function spawnItem() {
+                if (items.length >= MAX_ITEMS) return;
+                const d = difficulty();
+                const maxX = Math.max(1, viewW - ITEM_SIZE);
+
+                // Force the new spawn to land far from the previous one,
+                // so the player must swipe across the screen to chase items.
+                const MIN_GAP = Math.min(maxX * 0.45, BASKET_W * 2.5);
+                let x;
+                for (let tries = 0; tries < 6; tries++) {
+                    x = Math.random() * maxX;
+                    if (lastSpawnX < 0 || Math.abs(x - lastSpawnX) >= MIN_GAP) break;
+                }
+                lastSpawnX = x;
+
+                items.push({
+                    x,
+                    y: -ITEM_SIZE,
+                    w: ITEM_SIZE,
+                    h: ITEM_SIZE,
+                    vy: d.speedMin + Math.random() * (d.speedMax - d.speedMin),
+                    vx: (Math.random() < 0.5 ? -1 : 1) * d.drift * (0.6 + Math.random() * 0.4),
+                    hue: Math.floor(Math.random() * 60) + 20,
+                });
+            }
+
+            // --- Collision (AABB, basket width = 80px) ---
+            function intersects(a, b) {
+                return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+            }
+
+            // --- End Game: time expired → tiered reward + Gatekeeper lock ---
+            function endGame() {
+                if (gameState.ended) return;
+                gameState.ended = true;
+                gameState.running = false;
+                if (rafId) cancelAnimationFrame(rafId);
+                rafId = null;
+
+                const reward = getReward(gameState.score);
+                rewardScore.textContent = gameState.score;
+
+                // Lock-screen content (dynamic by tier)
+                if (reward) {
+                    rewardTitle.textContent = 'İndiriminiz Hazır!';
+                    rewardDiscount.textContent = '%' + reward.percent + ' İNDİRİM';
+                    rewardCode.textContent = reward.code;
+                } else {
+                    rewardTitle.textContent = 'Bir dahaki sefere!';
+                    rewardDiscount.textContent = 'İndirim Yok';
+                    rewardCode.textContent = '—';
+                }
+
+                // Activate the 3-hour lock (respect the testing toggle)
+                if (!DISABLE_LOCK_FOR_TESTING) {
+                    localStorage.setItem(LOCK_KEY, Date.now().toString());
+                }
+
+                gameScreen.classList.add('hidden');
+                lockScreen.classList.remove('hidden');
+                lockScreen.classList.add('flex');
+            }
+
+            // --- Update ---
+            function update(dt) {
+                // Timer countdown
+                gameState.timeLeft -= dt;
+                if (gameState.timeLeft <= 0) {
+                    gameState.timeLeft = 0;
+                    updateTimerUI();
+                    endGame();
+                    return;
+                }
+                updateTimerUI();
+
+                // Difficulty-scaled spawning
+                const d = difficulty();
+                spawnAcc += dt * 1000;
+                while (spawnAcc >= d.spawnInterval) {
+                    spawnAcc -= d.spawnInterval;
+                    spawnItem();
+                }
+                while (items.length < MIN_ITEMS) spawnItem();
+
+                for (let i = items.length - 1; i >= 0; i--) {
+                    const it = items[i];
+                    it.y += it.vy * dt;
+                    it.x += (it.vx || 0) * dt;
+
+                    // Bounce off the walls so drifting items stay reachable
+                    if (it.x < 0) { it.x = 0; it.vx = -it.vx; }
+                    else if (it.x > viewW - it.w) { it.x = viewW - it.w; it.vx = -it.vx; }
+
+                    if (intersects(it, basket)) {
+                        items.splice(i, 1);
+                        gameState.score += SCORE_PER_CATCH;
+                        updateMeterUI();
+                        continue;
+                    }
+                    if (it.y > viewH + ITEM_SIZE) items.splice(i, 1);
+                }
+            }
+
+            // --- Sprite assets: only the taco; the player is drawn procedurally ---
+            const tacoImg = new Image();
+            tacoImg.src = './taco.png';
+
+            // Cached background gradient — rebuilt only when canvas size changes
+            let bgGradient = null;
+            let bgGradientH = 0;
+            function getBgGradient() {
+                if (bgGradient && bgGradientH === viewH) return bgGradient;
+                const g = ctx.createLinearGradient(0, 0, 0, viewH);
+                g.addColorStop(0.00, '#ff8a3d');  // warm sunset orange
+                g.addColorStop(0.45, '#e0457b');  // pink-magenta horizon
+                g.addColorStop(1.00, '#221045');  // deep purple night
+                bgGradient = g;
+                bgGradientH = viewH;
+                return g;
+            }
+
+            // --- Stickman player — fits inside the 80×hitbox.h logical box ---
+            function drawStickman(hx, hy, hw, hh) {
+                // Geometry derived from the hitbox so the basket width stays 80px.
+                // The full stickman is taller than the hitbox; we anchor its FEET
+                // to the bottom of the hitbox so it stands above the floor.
+                const cx = hx + hw / 2;
+                const feetY = hy + hh;                 // bottom of hitbox = ground
+                const totalH = hw * 1.6;               // overall stickman height
+                const headR = hw * 0.16;
+                const headCx = cx;
+                const headCy = feetY - totalH + headR; // head centered at top
+                const neckY = headCy + headR;
+                const hipY = feetY - hw * 0.55;        // ~55% of width above ground
+                const shoulderY = neckY + (hipY - neckY) * 0.25;
+                const armSpan = hw * 0.9;              // total arm reach
+                const legSpread = hw * 0.55;
+
+                ctx.save();
+                ctx.lineWidth = 4;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.strokeStyle = 'black';
+
+                // Body
+                ctx.beginPath();
+                ctx.moveTo(cx, neckY);
+                ctx.lineTo(cx, hipY);
+                ctx.stroke();
+
+                // Arms (slightly raised, basket-carrying pose)
+                ctx.beginPath();
+                ctx.moveTo(cx - armSpan / 2, shoulderY + hw * 0.05);
+                ctx.lineTo(cx, shoulderY);
+                ctx.lineTo(cx + armSpan / 2, shoulderY + hw * 0.05);
+                ctx.stroke();
+
+                // Legs
+                ctx.beginPath();
+                ctx.moveTo(cx - legSpread / 2, feetY);
+                ctx.lineTo(cx, hipY);
+                ctx.lineTo(cx + legSpread / 2, feetY);
+                ctx.stroke();
+
+                // Head — white fill, black outline (drawn last so it sits on top)
+                ctx.beginPath();
+                ctx.arc(headCx, headCy, headR, 0, Math.PI * 2);
+                ctx.fillStyle = 'white';
+                ctx.fill();
+                ctx.stroke();
+
+                ctx.restore();
+            }
+
+            // --- Render ---
+            function render() {
+                // Festival sunset gradient background
+                ctx.fillStyle = getBgGradient();
+                ctx.fillRect(0, 0, viewW, viewH);
+
+                // Falling tacos
+                for (const it of items) {
+                    if (tacoImg.complete && tacoImg.naturalWidth > 0) {
+                        ctx.drawImage(tacoImg, it.x, it.y, it.w, it.h);
+                    } else {
+                        // Fallback while the sprite is still loading
+                        ctx.fillStyle = 'hsl(' + it.hue + ', 80%, 55%)';
+                        ctx.beginPath();
+                        ctx.arc(it.x + it.w / 2, it.y + it.h / 2, it.w / 2, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+
+                // Stickman player (hitbox: basket.x, basket.y, basket.w=80, basket.h)
+                drawStickman(basket.x, basket.y, basket.w, basket.h);
+            }
+
+            // --- Main Loop (delta-time, frame-rate independent) ---
+            function loop(now) {
+                if (!gameState.running) return;
+                let dt = (now - lastFrameTime) / 1000;
+                lastFrameTime = now;
+                if (dt > 0.05) dt = 0.05; // clamp after tab-switches
+                update(dt);
+                render();
+                rafId = requestAnimationFrame(loop);
+            }
+
+            document.addEventListener('visibilitychange', () => {
+                if (document.hidden) {
+                    if (rafId) cancelAnimationFrame(rafId);
+                    rafId = null;
+                } else if (gameState.running && !gameState.ended) {
+                    lastFrameTime = performance.now();
+                    rafId = requestAnimationFrame(loop);
+                }
+            });
+
+            window.addEventListener('resize', resizeCanvas);
+            window.addEventListener('orientationchange', resizeCanvas);
+
+            // --- Start: bypass mobile audio block via explicit tap (0ms tap delay) ---
+            let started = false;
+            function startGame(e) {
+                if (started) return;
+                started = true;
+                if (e && e.preventDefault) e.preventDefault();
+
+                // Unlock Web Audio (must be inside the user-gesture handler)
+                unlockAudio();
+
+                startBtn.style.display = 'none';
+                resizeCanvas();
+                basket.x = viewW / 2 - basket.w / 2;
+                basket.y = viewH - BASKET_Y_OFFSET;
+
+                // Reset round state
+                gameState.score = 0;
+                gameState.timeLeft = ROUND_SECONDS;
+                gameState.ended = false;
+                items.length = 0;
+                spawnAcc = 0;
+
+                for (let i = 0; i < MIN_ITEMS; i++) {
+                    spawnItem();
+                    if (items[i]) items[i].y = Math.random() * -viewH;
+                }
+                updateMeterUI();
+                updateTimerUI();
+                gameState.running = true;
+                lastFrameTime = performance.now();
+                rafId = requestAnimationFrame(loop);
+            }
+            // Prefer pointerdown/touchstart for instant fire (0ms tap latency).
+            // Fallback to click for non-pointer/non-touch environments.
+            if ('PointerEvent' in window) {
+                startBtn.addEventListener('pointerdown', startGame, { passive: false });
+            } else {
+                startBtn.addEventListener('touchstart', startGame, { passive: false });
+                startBtn.addEventListener('mousedown', startGame);
+            }
+            startBtn.addEventListener('click', startGame);
+        }
+
+        // Test için (Kilit ekranını denemek isterseniz aşağıdaki satırı aktif edin):
+        // localStorage.setItem(LOCK_KEY, Date.now().toString());
+    </script>
+
+    <!-- Service Worker: offline-first cache for festival cellular dead-zones -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw.js').catch((err) => {
+                    console.warn('SW registration failed:', err);
+                });
+            });
+        }
+    </script>
+</body>
+</html>
